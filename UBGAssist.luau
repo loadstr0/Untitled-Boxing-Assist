@@ -10,18 +10,24 @@ local player = Players.LocalPlayer
 local random = Random.new()
 local LumenUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/loadstr0/LumenUI/main/Loader.lua"))()
 local window = LumenUI:Require("Window").new({
-    Name = "UBGAssist", Title = "Boxing Assist", Size = UDim2.fromOffset(650, 510),
+    Name = "UBGAssist", Title = "Boxing Assist v2", Size = UDim2.fromOffset(650, 510),
     ToggleKeybind = Enum.KeyCode.RightControl, AutoSaveConfig = "settings",
 })
 local cfg = {enabled=false, dodge=false, block=false, box=false, ultimate=false,
-    dodgeChance=65, blockChance=80, reaction=140, range=9, interval=360,
+    dodgeChance=65, blockChance=80, reaction=60, range=9, interval=360, punchRange=6,
     stamina=25, blockFloor=20, hold=350, ultimateThreshold=100, heavyChance=0}
 local dead = false
 local connection
 local held = {}
 local pending
 local previousOpponent
-local wasPunching = false
+local lastAttack
+local activeAttack
+local attackStartedAt=0
+local attackWasActive=false
+local wasStunned = false
+local openingUntil = 0
+local openingUsed = true
 local nextPunch, nextDodge, nextUltimate = 0, 0, 0
 local counts = {attacks=0,dodges=0,blocks=0,punches=0,ultimates=0}
 local keys = {Dash="Space",Block="F",Ultimate="Q"}
@@ -96,12 +102,15 @@ toggle(defense,"Dodge assist","dodge")
 slider(defense,"Dodge chance (%)","dodgeChance",0,100,1)
 toggle(defense,"Block assist (fallback when dodge is not selected)","block")
 slider(defense,"Block chance (%)","blockChance",0,100,1)
-slider(defense,"Reaction delay (ms)","reaction",0,500,10)
+defense:Slider({Title="Reaction delay (ms)",Min=0,Max=300,Increment=10,Value=cfg.reaction,Flag="reactionV2",
+    Callback=function(v) cfg.reaction=v end})
 slider(defense,"Block hold (ms)","hold",100,1000,25)
 slider(defense,"Minimum block energy (%)","blockFloor",0,100,5)
-defense:Paragraph({Title="Chance behavior",Desc="One random decision per observed Punching transition. Missed attacks are not rerolled every frame. Detection depends on the opponent's replicated Punching attribute; multi-hit moves may count as one attack."})
-toggle(offense,"Auto boxing","box")
-slider(offense,"Punch interval (ms)","interval",150,1000,10)
+defense:Paragraph({Title="Chance behavior",Desc="One decision per numeric attack timestamp. Defense is scheduled before the replicated impact time when available. Counts show attempted inputs, not confirmed successful dodges."})
+toggle(offense,"Punish openings","box")
+slider(offense,"Minimum time between punish attempts (ms)","interval",150,1000,10)
+slider(offense,"Punch range (studs)","punchRange",3,9,0.25)
+offense:Paragraph({Title="One punch per opening",Desc="Attempt one punish after a detected attack ends or a new opponent stun. No idle timer punches or automatic combo spam. Opponent must be in range, in front, and not blocking. Attack-end recovery is a heuristic, not a guaranteed hit."})
 slider(offense,"Heavy punch chance (%)","heavyChance",0,100,1)
 toggle(offense,"Auto ultimate","ultimate")
 slider(offense,"Ultimate energy threshold","ultimateThreshold",1,200,1)
@@ -159,7 +168,9 @@ local function context()
     if (root.Position-targetRoot.Position).Magnitude>cfg.range then return nil,"Opponent outside assist range" end
     local stamina=100*value(data,"Stamina",0)/math.max(1,value(data,"MaxStamina",100))
     if stamina<cfg.stamina then return nil,"Recovering stamina" end
-    return {char=char,target=target,data=data,occupied=occupied},"Ready"
+    local opponentState=states:FindFirstChild(target.Name)
+    return {char=char,target=target,data=data,occupied=occupied,root=root,targetRoot=targetRoot,
+        opponentData=opponentState and opponentState:FindFirstChild("CharacterData")},"Ready"
 end
 local lastStatus=0
 local function tickAssist()
@@ -175,43 +186,69 @@ local function tickAssist()
             counts.attacks,counts.dodges,counts.blocks,counts.punches,counts.ultimates))
     end
     if not ctx then
-        pending=nil; previousOpponent=nil; wasPunching=false; releaseAll()
+        pending=nil; previousOpponent=nil; lastAttack=nil; activeAttack=nil
+        attackWasActive=false; wasStunned=false; openingUntil=0; openingUsed=true; releaseAll()
         return
     end
-    local punching=ctx.target:GetAttribute("Punching")==true
+    local attack=ctx.target:GetAttribute("Punching")
+    local punching=attack~=nil and attack~=false
+    local stunned=value(ctx.opponentData,"Stunned",false)
     if previousOpponent~=ctx.target then
-        previousOpponent=ctx.target; wasPunching=punching; pending=nil
-    elseif punching and not wasPunching then
+        previousOpponent=ctx.target; lastAttack=nil; activeAttack=nil; pending=nil
+        attackWasActive=false; wasStunned=stunned; openingUntil=0; openingUsed=true
+    end
+    if punching and attack~=lastAttack then
+        lastAttack=attack; activeAttack=attack; attackStartedAt=now; openingUntil=0; openingUsed=true
         counts.attacks+=1
         local action
         if cfg.dodge and random:NextNumber(0,100)<cfg.dodgeChance then action="Dash"
         elseif cfg.block and random:NextNumber(0,100)<cfg.blockChance then action="Block" end
-        if action then pending={action=action,at=now+cfg.reaction/1000,target=ctx.target} end
+        if action then
+            local delay=cfg.reaction/1000
+            local impact=ctx.target:GetAttribute("PreviousLandTime")
+            if type(impact)=="number" then
+                -- Use a duration between server timestamps; local tick() has a different clock.
+                local remaining=type(attack)=="number" and impact-attack or 0
+                if remaining>0 and remaining<2 then delay=math.min(delay,math.max(0,remaining-0.10)) end
+            end
+            pending={action=action,at=now+delay,expires=now+0.35,target=ctx.target,attack=attack}
+        end
     end
-    wasPunching=punching
+    if attackWasActive and not punching and activeAttack and now-attackStartedAt>=0.18 then
+        openingUntil=now+0.25; openingUsed=false
+    end
+    attackWasActive=punching
+    if stunned and not wasStunned then openingUntil=now+0.35; openingUsed=false end
+    wasStunned=stunned
     if pending and now>=pending.at then
         local decision=pending
-        pending=nil
-        if decision.target==ctx.target and punching and not value(ctx.occupied,"Punching",false)
+        if now>decision.expires or not punching or attack~=decision.attack then pending=nil
+        elseif decision.target==ctx.target and not value(ctx.occupied,"Punching",false)
             and not value(ctx.data,"Dashing",false) then
             if decision.action=="Dash" and now>=nextDodge then
                 releaseAll()
-                if press(keys.Dash,0.07,now) then counts.dodges+=1; nextDodge=now+0.6 end
+                if press(keys.Dash,0.07,now) then counts.dodges+=1; nextDodge=now+0.6; pending=nil end
             elseif decision.action=="Block" and value(ctx.occupied,"CanBlock",false) then
                 local energy=100*value(ctx.data,"BlockEnergy",0)/math.max(1,value(ctx.data,"MaxBlockEnergy",50))
-                if energy>=cfg.blockFloor and press(keys.Block,cfg.hold/1000,now) then counts.blocks+=1 end
+                if energy>=cfg.blockFloor and press(keys.Block,cfg.hold/1000,now) then counts.blocks+=1; pending=nil end
             end
         end
     end
     if next(held) or pending or value(ctx.data,"Blocking",false) or value(ctx.occupied,"Punching",false)
         or value(ctx.data,"Dashing",false) then return end
-    if cfg.ultimate and now>=nextUltimate and value(ctx.data,"UltimateEnergy",0)>=cfg.ultimateThreshold then
-        if press(keys.Ultimate,0.08,now) then counts.ultimates+=1; nextUltimate=now+2 end
+    local delta=ctx.targetRoot.Position-ctx.root.Position
+    local facing=delta.Magnitude>0.01 and ctx.root.CFrame.LookVector:Dot(delta.Unit)>0.5
+    local opening=not openingUsed and now<=openingUntil and not punching
+        and not value(ctx.opponentData,"Blocking",false) and not value(ctx.opponentData,"Dashing",false)
+        and facing and delta.Magnitude<=cfg.punchRange
+    if cfg.ultimate and opening and now>=nextUltimate and value(ctx.data,"UltimateEnergy",0)>=cfg.ultimateThreshold then
+        if press(keys.Ultimate,0.08,now) then counts.ultimates+=1; nextUltimate=now+2; openingUsed=true end
         return
     end
-    if cfg.box and now>=nextPunch and value(ctx.occupied,"CanPunch",false) and not punching then
+    if cfg.box and opening and now>=nextPunch and value(ctx.occupied,"CanPunch",false) then
         if random:NextNumber(0,100)<cfg.heavyChance then mouse2click() else mouse1click() end
         counts.punches+=1
+        openingUsed=true
         nextPunch=now+cfg.interval/1000
     end
 end
